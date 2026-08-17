@@ -1,0 +1,36 @@
+name: Smoke test a Worker
+description: >
+  Polls a freshly deployed Worker until it answers 200, or fails the job.
+  Packaged as a composite action rather than a script in the calling repo:
+  inside a reusable workflow `actions/checkout` clones the caller, so a path
+  like ./.github/scripts/smoke.sh resolves against the wrong repository. The
+  runner fetches an action's own code, which is what makes this portable.
+
+inputs:
+  url:
+    description: URL to poll. Must answer 200 within attempts x delay seconds.
+    required: true
+  attempts:
+    description: How many times to try before giving up.
+    required: false
+    default: "20"
+  delay:
+    description: Seconds between attempts.
+    required: false
+    default: "5"
+
+runs:
+  using: composite
+  steps:
+    # Invoked through `bash` rather than as ./smoke.sh so the action does not
+    # depend on the executable bit surviving a clone — it does not on every
+    # filesystem, and a lost +x here is a confusing "Permission denied".
+    #
+    # The URL arrives as an env var, never interpolated into the script body:
+    # it originates in wrangler output, which is not a value this repo controls.
+    - shell: bash
+      env:
+        URL: ${{ inputs.url }}
+        ATTEMPTS: ${{ inputs.attempts }}
+        DELAY: ${{ inputs.delay }}
+      run: bash "$GITHUB_ACTION_PATH/smoke.sh" "$URL" "$ATTEMPTS" "$DELAY"

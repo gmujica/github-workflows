@@ -1,0 +1,27 @@
+# Copiar a .github/workflows/rollback.yml en el proyecto y ajustar la URL.
+#
+# El workflow_dispatch vive aca, en el proyecto, y no en el repo base: el boton
+# "Run workflow" aparece en la pestaña Actions del proyecto, que es donde
+# alguien con produccion caida lo va a buscar.
+
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_id:
+        description: "ID de version de Cloudflare a poner de vuelta frente al trafico"
+        required: true
+        type: string
+      reason:
+        description: "Motivo (queda registrado en el run, para el post-mortem)"
+        required: true
+        type: string
+
+jobs:
+  rollback:
+    uses: gmujica/github-workflows/.github/workflows/rollback.yml@main
+    with:
+      version_id: ${{ inputs.version_id }}
+      reason: ${{ inputs.reason }}
+      production_url: https://proyect-ticket-manager.gmujica.workers.dev

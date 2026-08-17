@@ -7,13 +7,13 @@
 # the first attempt would make this a flake generator and it would be
 # switched off within a week.
 #
-# Usage: ./smoke.sh https://example.workers.dev
+# Usage: ./smoke.sh <url> [attempts] [delay]
 
 set -euo pipefail
 
-URL="${1:?usage: smoke.sh <url>}"
-ATTEMPTS=20
-DELAY=5
+URL="${1:?usage: smoke.sh <url> [attempts] [delay]}"
+ATTEMPTS="${2:-20}"
+DELAY="${3:-5}"
 
 for i in $(seq 1 "$ATTEMPTS"); do
   STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL" || echo "000")

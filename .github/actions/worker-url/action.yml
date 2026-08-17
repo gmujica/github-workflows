@@ -1,0 +1,32 @@
+name: Resolve the deployed Worker URL
+description: >
+  Reads the URL Cloudflare just wired up out of wrangler's ND-JSON output and
+  exposes it as an output, falling back to a constant when the parse comes back
+  empty. Packaged as a composite action for the same reason as the smoke test:
+  a reusable workflow cannot reach scripts that live in the calling repo.
+
+inputs:
+  ndjson-path:
+    description: Path wrangler wrote its ND-JSON record to (WRANGLER_OUTPUT_FILE_PATH).
+    required: true
+  fallback-url:
+    description: >
+      Used when the ND-JSON holds no URL. wrangler's output schema is meant for
+      CI but is not a frozen contract, so a format change should cost an
+      out-of-date link, not a red deploy that actually succeeded.
+    required: true
+
+outputs:
+  url:
+    description: The resolved URL. Always https, never empty.
+    value: ${{ steps.resolve.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        NDJSON_PATH: ${{ inputs.ndjson-path }}
+        FALLBACK_URL: ${{ inputs.fallback-url }}
+      run: bash "$GITHUB_ACTION_PATH/worker-url.sh" "$NDJSON_PATH" "$FALLBACK_URL"

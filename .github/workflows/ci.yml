@@ -1,29 +1,88 @@
 name: CI
 
+# Reusable. Nothing here triggers on its own — a project calls it:
+#
+#   jobs:
+#     ci:
+#       uses: gmujica/github-workflows/.github/workflows/ci.yml@main
+#       with:
+#         production_url: https://mi-worker.gmujica.workers.dev
+#         preview_url: https://dev-mi-worker.gmujica.workers.dev
+#
+# See examples/ci.yml for the full caller.
+#
+# `actions/checkout` below clones the *calling* repository, not this one, which
+# is what makes the whole thing work: the lint, the tests and the build all run
+# against the project's own code. It is also why the smoke test and the URL
+# resolution are composite actions instead of scripts — a path like
+# ./.github/scripts/smoke.sh would resolve against the caller, where it does
+# not exist. Action code is fetched by the runner, so it travels with the ref.
 on:
-  push:
-    branches: [master, dev]
-  pull_request:
+  workflow_call:
+    inputs:
+      production_url:
+        description: Public URL of the production Worker. Used as the smoke-test fallback.
+        required: true
+        type: string
+      preview_url:
+        description: Stable alias URL of the preview Worker.
+        required: true
+        type: string
+      production_branch:
+        description: Branch whose pushes deploy to production.
+        required: false
+        type: string
+        default: main
+      preview_branch:
+        description: Branch whose pushes upload a preview version.
+        required: false
+        type: string
+        default: dev
+      node_version_file:
+        description: File holding the Node version, read by CI and Workers Builds alike.
+        required: false
+        type: string
+        default: .node-version
+      bundle_limit_bytes:
+        description: >
+          Gzipped bundle ceiling. Workers Free caps a script at 3 MiB; the
+          default leaves room to notice the trend before hitting it. Raise to
+          10 MiB once the account moves to Workers Paid.
+        required: false
+        type: number
+        default: 2500000
+      run_lint:
+        description: Set false for a project that has no `lint` script yet.
+        required: false
+        type: boolean
+        default: true
+      artifact_retention_days:
+        description: How long the built bundles stay downloadable.
+        required: false
+        type: number
+        default: 7
+
+# No `secrets:` block on purpose. CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID
+# are environment secrets in the calling repository, and the deploy jobs below
+# reach them by declaring `environment:` — that is what keeps the preview job
+# from being able to read the production token. Declaring them here as
+# workflow_call secrets would shadow the environment ones with empty strings
+# whenever a caller forgot to pass them, which fails as a 401 halfway through a
+# deploy rather than as a missing input.
 
 # A second push to the same branch cancels the run still in flight — except on
 # pushes, which are the runs that deploy. Killing one of those halfway is worse
 # than paying for a minute of CI that a newer commit has already superseded.
+# Keyed by repository as well as ref: one reusable workflow now serves every
+# project, and two of them sharing a branch name must not share a lock.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Without this the GITHUB_TOKEN inherits whatever the organisation defaults to,
 # which is usually write. No job here pushes commits, comments or releases.
 permissions:
   contents: read
-
-# Declared once and read from three places: the fallback in the URL resolution
-# step, the smoke tests, and the step summaries. `env` is one of the contexts
-# GitHub allows in `environment.url`, so nothing here has to be repeated in the
-# environment blocks either.
-env:
-  PRODUCTION_URL: https://proyect-ticket-manager.gmujica.workers.dev
-  PREVIEW_URL: https://dev-proyect-ticket-manager.gmujica.workers.dev
 
 jobs:
   check:
@@ -36,14 +95,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           # Single source of truth for the Node version: local dev, CI, and
-          # Cloudflare Workers Builds all read .node-version. Vite 8 and
+          # Cloudflare Workers Builds all read the same file. Vite 8 and
           # jsdom 29 both need >=20.19, so anything older will not install.
-          node-version-file: .node-version
+          node-version-file: ${{ inputs.node_version_file }}
           cache: npm
 
       - run: npm ci
 
-      - run: npm run lint
+      - if: inputs.run_lint
+        run: npm run lint
 
       - run: npm test
 
@@ -60,7 +120,7 @@ jobs:
         with:
           name: dist-production-${{ github.sha }}
           path: dist/
-          retention-days: 7
+          retention-days: ${{ inputs.artifact_retention_days }}
           if-no-files-found: error
 
       # Validates the wrangler config, the bindings and the whole bundling step
@@ -69,13 +129,11 @@ jobs:
       - name: Validate the deploy without deploying
         run: npx wrangler deploy --dry-run --outdir=.dry-run
 
-      # The Workers Free plan caps a script at 3 MiB. The limit is worth
-      # guarding below rather than discovering as a failed production deploy;
-      # raise LIMIT once the account moves to Workers Paid (10 MiB).
       - name: Bundle size guard
+        env:
+          LIMIT: ${{ inputs.bundle_limit_bytes }}
         run: |
           SIZE=$(find .dry-run -name '*.js' -exec cat {} + | gzip -c | wc -c)
-          LIMIT=2500000
           echo "Bundle (gzip): $((SIZE / 1024)) KB — limit $((LIMIT / 1024)) KB"
           if [ "$SIZE" -ge "$LIMIT" ]; then
             echo "::error::Bundle over the limit"
@@ -84,7 +142,7 @@ jobs:
 
       # `--mode preview` reads .env.preview, and nothing else in this pipeline
       # ever reads that file. Building it here means a typo in it fails on the
-      # pull request instead of on the first push to dev.
+      # pull request instead of on the first push to the preview branch.
       - run: npm run build:preview
 
       - name: Keep the preview bundle
@@ -92,16 +150,17 @@ jobs:
         with:
           name: dist-preview-${{ github.sha }}
           path: dist/
-          retention-days: 7
+          retention-days: ${{ inputs.artifact_retention_days }}
           if-no-files-found: error
 
-  # Every push to `dev` uploads a new version of the Worker and points the `dev`
-  # alias at it. A version is not a deployment: production keeps serving
-  # whatever `master` last deployed, untouched. The alias URL is stable across
-  # pushes, so a link shared once goes on showing the latest dev build.
+  # Every push to the preview branch uploads a new version of the Worker and
+  # points its alias at it. A version is not a deployment: production keeps
+  # serving whatever the production branch last deployed, untouched. The alias
+  # URL is stable across pushes, so a link shared once goes on showing the
+  # latest build.
   preview:
     needs: check
-    if: github.ref == 'refs/heads/dev'
+    if: github.ref == format('refs/heads/{0}', inputs.preview_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -109,7 +168,8 @@ jobs:
     # follows the Worker if it ever moves to a custom domain. `steps` is a
     # context GitHub permits here because the field is evaluated once the job
     # has finished. It also scopes CLOUDFLARE_API_TOKEN: held as an environment
-    # secret, this job cannot read the production one and vice versa.
+    # secret in the calling repository, this job cannot read the production one
+    # and vice versa.
     environment:
       name: preview
       url: ${{ steps.url.outputs.url }}
@@ -119,7 +179,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version-file: .node-version
+          node-version-file: ${{ inputs.node_version_file }}
           cache: npm
 
       # Installs wrangler at the version the lockfile pins. No build follows:
@@ -154,26 +214,33 @@ jobs:
 
       - name: Resolve the uploaded URL
         id: url
-        run: ./.github/scripts/worker-url.sh "${{ runner.temp }}/wrangler.ndjson" "$PREVIEW_URL"
+        uses: gmujica/github-workflows/.github/actions/worker-url@main
+        with:
+          ndjson-path: ${{ runner.temp }}/wrangler.ndjson
+          fallback-url: ${{ inputs.preview_url }}
 
       - name: Smoke test
-        run: ./.github/scripts/smoke.sh "${{ steps.url.outputs.url }}"
+        uses: gmujica/github-workflows/.github/actions/smoke@main
+        with:
+          url: ${{ steps.url.outputs.url }}
 
       - name: Summarise the preview link
+        env:
+          PREVIEW_LINK: ${{ steps.url.outputs.url }}
         run: |
           {
             echo "### Preview"
             echo
-            echo "<${{ steps.url.outputs.url }}>"
+            echo "<$PREVIEW_LINK>"
             echo
             echo "Points at the staging API, so nothing here touches production data."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Production, and the only job that changes what the public URL serves.
-  # Reached by merging into master, never by pushing to dev.
+  # Reached by merging into the production branch, never by pushing to preview.
   deploy:
     needs: check
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == format('refs/heads/{0}', inputs.production_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -186,7 +253,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version-file: .node-version
+          node-version-file: ${{ inputs.node_version_file }}
           cache: npm
 
       - run: npm ci
@@ -197,10 +264,11 @@ jobs:
           name: dist-production-${{ github.sha }}
           path: dist/
 
-      # Same annotations as the preview job. On master the subject is usually
-      # the merge commit's — "Merge pull request #14 from gmujica/dev" — which
-      # is what makes the version findable from the PR it came from, and what
-      # makes it selectable in rollback.yml when one has to be undone.
+      # Same annotations as the preview job. On the production branch the
+      # subject is usually the merge commit's — "Merge pull request #14 from
+      # gmujica/dev" — which is what makes the version findable from the PR it
+      # came from, and what makes it selectable in rollback.yml when one has to
+      # be undone.
       - name: Deploy to production
         id: deploy
         run: |
@@ -214,18 +282,25 @@ jobs:
 
       - name: Resolve the deployed URL
         id: url
-        run: ./.github/scripts/worker-url.sh "${{ runner.temp }}/wrangler.ndjson" "$PRODUCTION_URL"
+        uses: gmujica/github-workflows/.github/actions/worker-url@main
+        with:
+          ndjson-path: ${{ runner.temp }}/wrangler.ndjson
+          fallback-url: ${{ inputs.production_url }}
 
       # wrangler exits 0 once Cloudflare accepts the upload, which says nothing
       # about whether the Worker serves a request. A missing binding or an unset
       # secret is a 500 on the first hit and a green pipeline.
       - name: Smoke test
-        run: ./.github/scripts/smoke.sh "${{ steps.url.outputs.url }}"
+        uses: gmujica/github-workflows/.github/actions/smoke@main
+        with:
+          url: ${{ steps.url.outputs.url }}
 
       - name: Summarise the deploy
+        env:
+          DEPLOY_LINK: ${{ steps.url.outputs.url }}
         run: |
           {
             echo "### Production"
             echo
-            echo "<${{ steps.url.outputs.url }}> · \`$(git rev-parse --short HEAD)\`"
+            echo "<$DEPLOY_LINK> · \`$(git rev-parse --short HEAD)\`"
           } >> "$GITHUB_STEP_SUMMARY"
