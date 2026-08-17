@@ -1,11 +1,14 @@
-# Copiar a .github/workflows/ci.yml en el proyecto y ajustar las dos URLs.
-# Esto es todo lo que un proyecto necesita: el pipeline vive en el repo base.
+# Copiar a .github/workflows/ci.yml en el proyecto y reemplazar los dos
+# placeholders. Esto es todo lo que un proyecto necesita: el pipeline vive
+# en el repo base.
 
 name: CI
 
 on:
   push:
-    branches: [master, dev]
+    # Tienen que coincidir con production_branch y preview_branch de abajo.
+    # Si no coinciden, el job corre y no despliega nada, en silencio.
+    branches: [main, dev]
   pull_request:
 
 jobs:
@@ -16,13 +19,12 @@ jobs:
     # a @v1 aca y dejar que Dependabot proponga los saltos.
     uses: gmujica/github-workflows/.github/workflows/ci.yml@main
     with:
-      production_url: https://proyect-ticket-manager.gmujica.workers.dev
-      preview_url: https://dev-proyect-ticket-manager.gmujica.workers.dev
+      production_url: https://NOMBRE-DEL-WORKER.TU-SUBDOMINIO.workers.dev
+      preview_url: https://dev-NOMBRE-DEL-WORKER.TU-SUBDOMINIO.workers.dev
 
-      # Este proyecto es de los viejos y usa master. Los nuevos pueden omitir
-      # las dos lineas: el default del workflow base es main/dev.
-      production_branch: master
-      preview_branch: dev
+      # Solo si el proyecto no usa main/dev. Un repo viejo con master pondria:
+      #   production_branch: master
+      #   preview_branch: dev
 
       # Opcionales, con estos defaults:
       #   node_version_file: .node-version

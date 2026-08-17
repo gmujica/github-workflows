@@ -1,4 +1,5 @@
-# Copiar a .github/workflows/rollback.yml en el proyecto y ajustar la URL.
+# Copiar a .github/workflows/rollback.yml en el proyecto y reemplazar el
+# placeholder de la URL.
 #
 # El workflow_dispatch vive aca, en el proyecto, y no en el repo base: el boton
 # "Run workflow" aparece en la pestaña Actions del proyecto, que es donde
@@ -24,4 +25,4 @@ jobs:
     with:
       version_id: ${{ inputs.version_id }}
       reason: ${{ inputs.reason }}
-      production_url: https://proyect-ticket-manager.gmujica.workers.dev
+      production_url: https://NOMBRE-DEL-WORKER.TU-SUBDOMINIO.workers.dev

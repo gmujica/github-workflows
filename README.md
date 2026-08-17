@@ -13,27 +13,123 @@ El pipeline vive aca; cada proyecto aporta un archivo de ~15 lineas que lo llama
 examples/                           Los dos archivos a copiar al proyecto
 ```
 
-## Como se usa
+## Alta de un proyecto nuevo
 
-Copiar `examples/ci.yml` y `examples/rollback.yml` a `.github/workflows/` del
-proyecto y ajustar las URLs. Nada mas. El `ci.yml` del proyecto queda asi:
+Siete pasos. Los primeros cuatro son del proyecto y de Cloudflare; recien el
+quinto toca este repo.
 
-```yaml
-name: CI
+### 1. Scripts npm
 
-on:
-  push:
-    branches: [master, dev]
-  pull_request:
+El pipeline invoca estos verbos por nombre. Son convencion, no inputs: que todos
+los proyectos expongan los mismos es la mitad del valor de tener una base.
 
-jobs:
-  ci:
-    uses: gmujica/github-workflows/.github/workflows/ci.yml@main
-    with:
-      production_url: https://mi-worker.gmujica.workers.dev
-      preview_url: https://dev-mi-worker.gmujica.workers.dev
-      production_branch: master   # default: main
+```json
+{
+  "scripts": {
+    "lint": "eslint .",
+    "test": "vitest run",
+    "build": "vite build",
+    "build:preview": "vite build --mode preview",
+    "deploy:cf": "wrangler deploy",
+    "deploy:preview": "wrangler versions upload --preview-alias dev"
+  }
+}
 ```
+
+Dos detalles que rompen cosas si se pasan por alto:
+
+- **`deploy:cf` y `deploy:preview` no tienen que buildear.** El pipeline
+  restaura el bundle que ya construyo, lintó y midio en el job `check`. Si el
+  script hace `npm run build && wrangler deploy`, ese trabajo se tira y se
+  despliega un artefacto que nadie testeo.
+- **`deploy:preview` necesita `--preview-alias`.** Sin eso se sube una version
+  pero ningun alias apunta a ella, y `preview_url` queda mostrando la anterior.
+
+Ambos scripts reciben `--tag` y `--message` por `--`, asi que tienen que
+terminar en el comando de wrangler, no en un `&&`.
+
+### 2. Archivos que el proyecto tiene que tener
+
+```
+.node-version          Version de Node. La leen el CI y Cloudflare Workers Builds
+.env.preview           Lo lee `npm run build:preview`
+wrangler.toml/.jsonc   Config del Worker
+```
+
+### 3. Crear el Worker en Cloudflare
+
+Un primer deploy manual desde la maquina, para que el Worker exista y la URL
+resuelva:
+
+```bash
+npx wrangler deploy
+```
+
+Anotar la URL que imprime: es el `production_url` del paso 5. La de preview es
+la misma con el prefijo del alias (`https://dev-<worker>.<subdominio>.workers.dev`).
+
+### 4. Environments y secretos en GitHub
+
+En **Settings → Environments** del proyecto, crear dos: `preview` y
+`production`. En cada uno, como **secreto de environment** (no de repositorio):
+
+```
+CLOUDFLARE_API_TOKEN     Token con permiso Edit Cloudflare Workers
+CLOUDFLARE_ACCOUNT_ID
+```
+
+Que sean de environment y no de repositorio es lo que impide que el job de
+preview pueda leer el token de produccion. Si se cargan a nivel repositorio el
+aislamiento desaparece, aunque el pipeline siga andando.
+
+En `production` conviene ademas marcar **Required reviewers**. El rollback
+hereda esa proteccion, que es lo correcto incluso bajo presion: un rollback a la
+version equivocada es un segundo incidente.
+
+### 5. Copiar los dos archivos
+
+```bash
+cp examples/ci.yml       tu-proyecto/.github/workflows/ci.yml
+cp examples/rollback.yml tu-proyecto/.github/workflows/rollback.yml
+```
+
+Reemplazar `NOMBRE-DEL-WORKER.TU-SUBDOMINIO` por lo del paso 3, en los dos
+archivos. Si el repo usa `master` en vez de `main`, descomentar
+`production_branch` / `preview_branch` en `ci.yml` **y** ajustar la lista de
+`on.push.branches`, que es independiente.
+
+### 6. Ramas
+
+El modelo asume dos: `main` (o `master`) para produccion y `dev` para preview.
+Crear `dev` si no existe, y proteger la de produccion exigiendo PR — es lo que
+hace que el mensaje del merge commit quede util en el tab Deployments de
+Cloudflare.
+
+### 7. Primer run
+
+Pushear a `dev` y mirar el run. En orden, tiene que verse:
+
+1. `check` verde
+2. `preview` desplegando y el smoke test en 200
+3. El link en el step summary y en la pestaña Environments
+
+Si `check` pasa pero `preview` no arranca, `preview_branch` no coincide con la
+rama. Si el smoke test falla con la URL vieja, falta el `--preview-alias` del
+paso 1.
+
+Una vez que `dev` funciona, mergear a produccion y confirmar que `deploy`
+corre y que el rollback aparece en la pestaña Actions.
+
+## Si algo falla en el primer run
+
+| Sintoma | Causa casi siempre |
+|---|---|
+| `workflow was not found` | El ref del `uses:` no existe, o el repo base dejo de ser publico |
+| 401 / 403 en el deploy | Los secretos estan a nivel repositorio y no de environment, o al token le falta Edit Workers |
+| `check` verde y ningun deploy | `production_branch`/`preview_branch` no coinciden con `on.push.branches` |
+| Smoke test 200 pero sirve codigo viejo | `deploy:preview` sin `--preview-alias`, o el deploy fallo en silencio |
+| Smoke test nunca llega a 200 | Falta un binding o un secreto del Worker: responde 500 desde el primer hit |
+| `Permission denied` en un script | Se perdio el bit +x; las actions invocan por `bash`, asi que no deberia pasar |
 
 ## Por que composite actions y no scripts
 
@@ -62,30 +158,18 @@ copiarse.
 `rollback.yml` toma `version_id`, `reason`, `production_url` y
 `node_version_file`.
 
-## Lo que el proyecto consumidor tiene que aportar
+## Por que no hay bloque `secrets:`
 
-Los workflows asumen que existen, y fallan sin ellos:
+Los requisitos del proyecto consumidor —scripts npm, archivos, environments—
+estan en **Alta de un proyecto nuevo**, arriba. Falta uno de ellos y el
+pipeline falla; ninguno tiene default.
 
-- `.node-version` — leido por CI y por Cloudflare Workers Builds
-- `.env.preview` — leido por `npm run build:preview`
-- Config de wrangler (`wrangler.toml` o `wrangler.jsonc`)
-- Scripts npm: `lint`, `test`, `build`, `build:preview`, `deploy:cf`, `deploy:preview`
-
-Los nombres de los scripts npm son convencion, no inputs, a proposito: que
-todos los proyectos expongan los mismos verbos es la mitad del valor de tener
-una base.
-
-## Environments y secretos
-
-En cada proyecto, dos environments —`preview` y `production`— cada uno con sus
-propios `CLOUDFLARE_API_TOKEN` y `CLOUDFLARE_ACCOUNT_ID`.
-
-Tienen que ser **secretos de environment**, no de repositorio. Los jobs
-declaran `environment:` y los leen directamente; ese es el mecanismo que impide
-que el job de preview pueda tocar las credenciales de produccion. Por eso
-`ci.yml` no declara un bloque `secrets:` de `workflow_call`: declararlos ahi los
-pisaria con string vacio cada vez que un caller se olvidara de pasarlos, y eso
-falla como un 401 a mitad de un deploy en vez de como un input faltante.
+Lo que si vale explicar aca es una ausencia: `ci.yml` no declara un bloque
+`secrets:` de `workflow_call`. Los tokens son secretos de environment y los
+jobs los alcanzan declarando `environment:`. Declararlos tambien en
+`workflow_call` los pisaria con string vacio cada vez que un caller se olvidara
+de pasarlos, y eso falla como un 401 a mitad de un deploy en vez de como un
+input faltante.
 
 ## Versionado
 

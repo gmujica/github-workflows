@@ -6,8 +6,8 @@ name: CI
 #     ci:
 #       uses: gmujica/github-workflows/.github/workflows/ci.yml@main
 #       with:
-#         production_url: https://mi-worker.gmujica.workers.dev
-#         preview_url: https://dev-mi-worker.gmujica.workers.dev
+#         production_url: https://NOMBRE-DEL-WORKER.TU-SUBDOMINIO.workers.dev
+#         preview_url: https://dev-NOMBRE-DEL-WORKER.TU-SUBDOMINIO.workers.dev
 #
 # See examples/ci.yml for the full caller.
 #
