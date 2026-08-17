@@ -1,0 +1,23 @@
+version: 2
+
+updates:
+  # The workflows pin actions by mutable tag (`actions/checkout@v4`), so the
+  # code that runs with CLOUDFLARE_API_TOKEN in scope can change without a
+  # commit here. Dependabot at least makes each move visible as a PR.
+  # Pinning by commit SHA is the stronger fix; Dependabot keeps those current
+  # too, and rewrites the trailing version comment when it bumps them.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+    groups:
+      # One PR for the routine patch/minor churn. Majors stay separate: those
+      # are the ones that need reading before merging.
+      actions-minor:
+        update-types:
+          - minor
+          - patch

@@ -1,0 +1,231 @@
+name: CI
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+
+# A second push to the same branch cancels the run still in flight — except on
+# pushes, which are the runs that deploy. Killing one of those halfway is worse
+# than paying for a minute of CI that a newer commit has already superseded.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Without this the GITHUB_TOKEN inherits whatever the organisation defaults to,
+# which is usually write. No job here pushes commits, comments or releases.
+permissions:
+  contents: read
+
+# Declared once and read from three places: the fallback in the URL resolution
+# step, the smoke tests, and the step summaries. `env` is one of the contexts
+# GitHub allows in `environment.url`, so nothing here has to be repeated in the
+# environment blocks either.
+env:
+  PRODUCTION_URL: https://proyect-ticket-manager.gmujica.workers.dev
+  PREVIEW_URL: https://dev-proyect-ticket-manager.gmujica.workers.dev
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Single source of truth for the Node version: local dev, CI, and
+          # Cloudflare Workers Builds all read .node-version. Vite 8 and
+          # jsdom 29 both need >=20.19, so anything older will not install.
+          node-version-file: .node-version
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm test
+
+      # Catches build-only failures the tests cannot see, such as a bad import
+      # path that Vitest resolves but Rollup does not.
+      - run: npm run build
+
+      # The deploy jobs ship *this* bundle rather than rebuilding their own.
+      # Two builds from two runners are usually identical, but "usually" is
+      # what makes the exceptions expensive: a floating transitive dependency
+      # or a partial install produces an artefact nothing ever tested.
+      - name: Keep the production bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-production-${{ github.sha }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+      # Validates the wrangler config, the bindings and the whole bundling step
+      # without credentials and without touching the account. Everything this
+      # catches would otherwise surface only after a merge, as a red deploy.
+      - name: Validate the deploy without deploying
+        run: npx wrangler deploy --dry-run --outdir=.dry-run
+
+      # The Workers Free plan caps a script at 3 MiB. The limit is worth
+      # guarding below rather than discovering as a failed production deploy;
+      # raise LIMIT once the account moves to Workers Paid (10 MiB).
+      - name: Bundle size guard
+        run: |
+          SIZE=$(find .dry-run -name '*.js' -exec cat {} + | gzip -c | wc -c)
+          LIMIT=2500000
+          echo "Bundle (gzip): $((SIZE / 1024)) KB — limit $((LIMIT / 1024)) KB"
+          if [ "$SIZE" -ge "$LIMIT" ]; then
+            echo "::error::Bundle over the limit"
+            exit 1
+          fi
+
+      # `--mode preview` reads .env.preview, and nothing else in this pipeline
+      # ever reads that file. Building it here means a typo in it fails on the
+      # pull request instead of on the first push to dev.
+      - run: npm run build:preview
+
+      - name: Keep the preview bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-preview-${{ github.sha }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  # Every push to `dev` uploads a new version of the Worker and points the `dev`
+  # alias at it. A version is not a deployment: production keeps serving
+  # whatever `master` last deployed, untouched. The alias URL is stable across
+  # pushes, so a link shared once goes on showing the latest dev build.
+  preview:
+    needs: check
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # The URL comes from what Cloudflare reported, not from a constant, so it
+    # follows the Worker if it ever moves to a custom domain. `steps` is a
+    # context GitHub permits here because the field is evaluated once the job
+    # has finished. It also scopes CLOUDFLARE_API_TOKEN: held as an environment
+    # secret, this job cannot read the production one and vice versa.
+    environment:
+      name: preview
+      url: ${{ steps.url.outputs.url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      # Installs wrangler at the version the lockfile pins. No build follows:
+      # the bundle comes from `check`, already linted, tested and measured.
+      - run: npm ci
+
+      - name: Restore the tested preview bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-preview-${{ github.sha }}
+          path: dist/
+
+      # `--tag` and `--message` are the only thread back to here. Cloudflare
+      # records the version but knows nothing of the build that produced it, so
+      # without them its Deployments tab is a list of bare hashes and timestamps.
+      # The subject is cut at 80 characters because commit subjects here are not
+      # always short and the annotation is read in a narrow column.
+      #
+      # WRANGLER_OUTPUT_FILE_PATH makes wrangler write an ND-JSON record per
+      # operation alongside its usual logs — worker name, version id, and the
+      # HTTP targets it just wired up.
+      - name: Upload the preview version
+        id: deploy
+        run: |
+          npm run deploy:preview -- \
+            --tag "$(git rev-parse --short HEAD)" \
+            --message "$(git log -1 --pretty=%s | cut -c1-80) · run ${{ github.run_number }}"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler.ndjson
+
+      - name: Resolve the uploaded URL
+        id: url
+        run: ./.github/scripts/worker-url.sh "${{ runner.temp }}/wrangler.ndjson" "$PREVIEW_URL"
+
+      - name: Smoke test
+        run: ./.github/scripts/smoke.sh "${{ steps.url.outputs.url }}"
+
+      - name: Summarise the preview link
+        run: |
+          {
+            echo "### Preview"
+            echo
+            echo "<${{ steps.url.outputs.url }}>"
+            echo
+            echo "Points at the staging API, so nothing here touches production data."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Production, and the only job that changes what the public URL serves.
+  # Reached by merging into master, never by pushing to dev.
+  deploy:
+    needs: check
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    environment:
+      name: production
+      url: ${{ steps.url.outputs.url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - run: npm ci
+
+      - name: Restore the tested production bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-production-${{ github.sha }}
+          path: dist/
+
+      # Same annotations as the preview job. On master the subject is usually
+      # the merge commit's — "Merge pull request #14 from gmujica/dev" — which
+      # is what makes the version findable from the PR it came from, and what
+      # makes it selectable in rollback.yml when one has to be undone.
+      - name: Deploy to production
+        id: deploy
+        run: |
+          npm run deploy:cf -- \
+            --tag "$(git rev-parse --short HEAD)" \
+            --message "$(git log -1 --pretty=%s | cut -c1-80) · run ${{ github.run_number }}"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler.ndjson
+
+      - name: Resolve the deployed URL
+        id: url
+        run: ./.github/scripts/worker-url.sh "${{ runner.temp }}/wrangler.ndjson" "$PRODUCTION_URL"
+
+      # wrangler exits 0 once Cloudflare accepts the upload, which says nothing
+      # about whether the Worker serves a request. A missing binding or an unset
+      # secret is a 500 on the first hit and a green pipeline.
+      - name: Smoke test
+        run: ./.github/scripts/smoke.sh "${{ steps.url.outputs.url }}"
+
+      - name: Summarise the deploy
+        run: |
+          {
+            echo "### Production"
+            echo
+            echo "<${{ steps.url.outputs.url }}> · \`$(git rev-parse --short HEAD)\`"
+          } >> "$GITHUB_STEP_SUMMARY"

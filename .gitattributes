@@ -1,0 +1,8 @@
+# Los workflows corren en ubuntu-latest. Un .sh con CRLF falla ahi con
+# "bad interpreter: /usr/bin/env bash^M", y el repo se edita desde Windows,
+# donde git convierte a CRLF por defecto. Se fuerza LF en todo lo que el
+# runner ejecuta o parsea, sin depender de la config local de cada maquina.
+*.sh  text eol=lf
+*.yml text eol=lf
+
+* text=auto

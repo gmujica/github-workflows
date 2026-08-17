@@ -1,0 +1,96 @@
+name: Rollback
+
+# Manual only. The version ID comes from the Cloudflare dashboard, under the
+# Worker's Deployments tab — the same list the `--tag` and `--message` written
+# by ci.yml annotate, which is what makes a version findable by the PR it came
+# from rather than by guessing at timestamps.
+on:
+  workflow_dispatch:
+    inputs:
+      version_id:
+        description: "Cloudflare version ID to put back in front of traffic"
+        required: true
+        type: string
+      reason:
+        description: "Why (recorded on the run, for the post-mortem)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Two rollbacks racing to point production at different versions is exactly the
+# failure this workflow exists to fix, and it would happen under the pressure
+# that makes it least likely to be caught. The second run waits its turn.
+# Never cancel-in-progress: a rollback killed between the deploy and the smoke
+# test leaves production in a state nobody has verified.
+concurrency:
+  group: rollback-production
+  cancel-in-progress: false
+
+env:
+  PRODUCTION_URL: https://proyect-ticket-manager.gmujica.workers.dev
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    # Inherits whatever protection rules production carries. If required
+    # reviewers are set, this waits for one — which is the right trade even
+    # under pressure, since a rollback to the wrong version is a second outage.
+    environment:
+      name: production
+      url: ${{ steps.url.outputs.url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - run: npm ci
+
+      # The inputs reach the shell through `env`, never through `${{ }}` inside
+      # `run`. Interpolation happens before bash sees the script, so a reason
+      # containing a quote would otherwise run as a command — on the runner that
+      # is holding CLOUDFLARE_API_TOKEN. As env vars they are only ever data.
+      - name: Point production at the given version
+        id: deploy
+        run: |
+          npx wrangler versions deploy "$VERSION_ID@100%" --yes \
+            --message "Rollback · $REASON · run $GITHUB_RUN_NUMBER"
+        env:
+          VERSION_ID: ${{ inputs.version_id }}
+          REASON: ${{ inputs.reason }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler.ndjson
+
+      - name: Resolve the deployed URL
+        id: url
+        run: ./.github/scripts/worker-url.sh "${{ runner.temp }}/wrangler.ndjson" "$PRODUCTION_URL"
+
+      - name: Smoke test
+        run: ./.github/scripts/smoke.sh "${{ steps.url.outputs.url }}"
+
+      # Same reason as above: the summary is a shell script too, so the inputs
+      # come in as env vars here as well.
+      - name: Record what happened
+        run: |
+          {
+            echo "### Rollback"
+            echo
+            echo "- Version: \`$VERSION_ID\`"
+            echo "- Reason: $REASON"
+            echo "- By: @$GITHUB_ACTOR"
+            echo "- Serving: <$SERVING_URL>"
+            echo
+            echo "master still points at the broken commit. Revert it before the next merge."
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          VERSION_ID: ${{ inputs.version_id }}
+          REASON: ${{ inputs.reason }}
+          SERVING_URL: ${{ steps.url.outputs.url }}

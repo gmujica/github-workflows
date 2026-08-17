@@ -1,0 +1,21 @@
+# IDEs
+.idea/
+.vscode/
+*.swp
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Build / CI scratch
+dist/
+.dry-run/
+
+# Entorno
+.env
+.env.local
+.env.*.local
+
+# SO
+.DS_Store
+Thumbs.db
