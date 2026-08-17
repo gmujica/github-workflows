@@ -116,7 +116,7 @@ jobs:
       # what makes the exceptions expensive: a floating transitive dependency
       # or a partial install produces an artefact nothing ever tested.
       - name: Keep the production bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-production-${{ github.sha }}
           path: dist/
@@ -146,7 +146,7 @@ jobs:
       - run: npm run build:preview
 
       - name: Keep the preview bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-preview-${{ github.sha }}
           path: dist/
